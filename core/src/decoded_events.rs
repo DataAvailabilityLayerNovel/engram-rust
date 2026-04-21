@@ -1,0 +1,145 @@
+use crate::{HasHeader, types::metadata::StringOrBytes};
+use codec::{Decode, Encode};
+
+pub trait TransactionEventEncodable {
+	/// SCALE encodes the event
+	///
+	/// If you need to Hex and SCALE encode then call `encode_as_hex_event`
+	fn to_event(&self) -> Vec<u8>;
+}
+
+pub trait TransactionEventDecodable: Sized {
+	/// Decodes the SCALE encoded Event
+	///
+	/// If you need to decode Hex string call `decode_hex_event`
+	fn from_event<'a>(event: impl Into<StringOrBytes<'a>>) -> Result<Self, String>;
+}
+
+impl<T: HasHeader + Encode> TransactionEventEncodable for T {
+	fn to_event(&self) -> Vec<u8> {
+		let pallet_id = Self::HEADER_INDEX.0;
+		let variant_id = Self::HEADER_INDEX.1;
+		let mut encoded_event: Vec<u8> = vec![pallet_id, variant_id];
+		Self::encode_to(self, &mut encoded_event);
+
+		encoded_event
+	}
+}
+
+impl<T: HasHeader + Decode> TransactionEventDecodable for T {
+	fn from_event<'a>(event: impl Into<StringOrBytes<'a>>) -> Result<Self, String> {
+		fn inner<T: HasHeader + Decode>(event: StringOrBytes) -> Result<T, String> {
+			let event: &[u8] = match &event {
+				StringOrBytes::StringRef(s) => {
+					&const_hex::decode(s.trim_start_matches("0x")).map_err(|x| x.to_string())?
+				},
+				StringOrBytes::BoxedString(s) => {
+					&const_hex::decode(s.trim_start_matches("0x")).map_err(|x| x.to_string())?
+				},
+				StringOrBytes::Bytes(b) => b,
+				StringOrBytes::BoxedBytes(b) => b,
+			};
+
+			// This was moved out in order to decrease compilation times
+			check_header(event, T::HEADER_INDEX)?;
+
+			let mut data = if event.len() <= 2 { &[] } else { &event[2..] };
+			Ok(T::decode(&mut data).map_err(|x| x.to_string())?)
+		}
+
+		inner(event.into())
+	}
+}
+
+// Purely here to decrease compilation times
+pub(crate) fn check_header(data: &[u8], header_index: (u8, u8)) -> Result<(), String> {
+	if data.len() < 2 {
+		return Err("Failed to decode. Not have enough bytes to decode the header".into());
+	}
+
+	let (pallet_id, variant_id) = (data[0], data[1]);
+	if header_index.0 != pallet_id || header_index.1 != variant_id {
+		let err = std::format!(
+			"Failed to decode. Mismatch in pallet and/or variant id. Actual: PI: {}, VI: {} Expected: PI: {}, VI: {}",
+			pallet_id,
+			variant_id,
+			header_index.0,
+			header_index.1
+		);
+		return Err(err);
+	}
+
+	Ok(())
+}
+
+/* /// Contains only the event body. Phase and topics are not included here.
+#[derive(Debug, Clone)]
+pub struct RawEvent(pub Vec<u8>);
+
+impl RawEvent {
+	pub fn pallet_index(&self) -> u8 {
+		self.0[0]
+	}
+
+	pub fn variant_index(&self) -> u8 {
+		self.0[1]
+	}
+
+	pub fn event_data(&self) -> &[u8] {
+		if self.0.len() <= 2 { &[] } else { &self.0[2..] }
+	}
+}
+
+impl TryFrom<String> for RawEvent {
+	type Error = String;
+
+	fn try_from(value: String) -> Result<Self, Self::Error> {
+		Self::try_from(value.as_str())
+	}
+}
+
+impl TryFrom<&String> for RawEvent {
+	type Error = String;
+
+	fn try_from(value: &String) -> Result<Self, Self::Error> {
+		Self::try_from(value.as_str())
+	}
+}
+
+impl TryFrom<&str> for RawEvent {
+	type Error = String;
+
+	fn try_from(value: &str) -> Result<Self, Self::Error> {
+		let value = const_hex::decode(value).map_err(|x| x.to_string())?;
+		Self::try_from(value)
+	}
+}
+
+impl TryFrom<Vec<u8>> for RawEvent {
+	type Error = String;
+
+	fn try_from(value: Vec<u8>) -> Result<Self, Self::Error> {
+		Self::try_from(value.as_slice())
+	}
+}
+
+impl TryFrom<&Vec<u8>> for RawEvent {
+	type Error = String;
+
+	fn try_from(value: &Vec<u8>) -> Result<Self, Self::Error> {
+		Self::try_from(value.as_slice())
+	}
+}
+
+impl TryFrom<&[u8]> for RawEvent {
+	type Error = String;
+
+	fn try_from(value: &[u8]) -> Result<Self, Self::Error> {
+		if value.len() < 2 {
+			return Err("Event must have more than one byte".into());
+		}
+
+		Ok(RawEvent(value.to_owned()))
+	}
+}
+ */

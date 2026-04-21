@@ -1,0 +1,52 @@
+[package]
+name = "avail-rust-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Avail Rust SDK core library"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+serde = { workspace = true }
+serde_json = {  workspace = true }
+codec = { workspace = true  }
+impl-serde = { workspace = true }
+const-hex = { workspace = true, default-features = false }
+primitive-types = { workspace = true }
+thiserror = { workspace = true }
+sp-crypto-hashing = { workspace = true }
+schnorrkel = { workspace = true }
+
+# Scale
+scale-info = { workspace = true }
+scale-decode = { workspace = true }
+scale-encode = { workspace = true }
+
+# Subxt
+subxt-core = { workspace = true }
+subxt-signer = {workspace = true }
+subxt-rpcs = { workspace = true }
+
+# Enabled with next
+base64 = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["sync", "time", "rt", "macros"]  }
+
+[features]
+default = ["native"]
+native = [
+	"subxt-core/std",
+	"subxt-signer/std",
+	"subxt-rpcs/native",
+]
+wasm = [
+	"subxt-signer/web",
+	"subxt-rpcs/web",
+]
+next = [
+	"dep:base64"
+]
