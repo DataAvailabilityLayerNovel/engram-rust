@@ -16,4 +16,3 @@ impl crate::subxt_core::Config for AvailConfig {
 	type Header = avail_rust_core::AvailHeader;
 	type Signature = avail_rust_core::MultiSignature;
 }
-
