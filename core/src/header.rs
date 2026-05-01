@@ -142,7 +142,7 @@ impl Decode for DataLookupItem {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
+#[serde(default, rename_all = "camelCase")]
 pub struct KateCommitment {
 	// Compact
 	pub rows: u16,
@@ -182,6 +182,7 @@ pub struct V4CompactDataLookup {
 	#[codec(compact)]
 	pub size: u32,
 	pub index: Vec<DataLookupItem>,
+	#[serde(default)]
 	pub rows_per_tx: Vec<u16>,
 }
 
