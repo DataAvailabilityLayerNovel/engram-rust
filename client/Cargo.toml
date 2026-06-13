@@ -15,6 +15,7 @@ const-hex = { workspace = true, default-features = false }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { version = "0.10", default-features = false }
 frame-metadata = { workspace = true }
 futures = { workspace = true }
 codec = { workspace = true  }

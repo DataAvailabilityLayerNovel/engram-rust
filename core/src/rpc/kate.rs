@@ -65,6 +65,7 @@ pub struct BlockLength {
 	pub max: PerDispatchClassU32,
 	pub cols: u32,
 	pub rows: u32,
+	#[serde(alias = "chunkSize")]
 	pub chunk_size: u32,
 }
 
