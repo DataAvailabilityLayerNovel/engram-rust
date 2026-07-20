@@ -1,10 +1,20 @@
 use avail_rust_client::prelude::*;
 use std::env;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::time::{timeout, Duration};
+use tokio::time::{Duration, timeout};
 
 fn env_u32(key: &str, default: u32) -> u32 {
-	env::var(key).ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(default)
+	env::var(key)
+		.ok()
+		.and_then(|v| v.parse::<u32>().ok())
+		.unwrap_or(default)
+}
+
+fn env_u64(key: &str, default: u64) -> u64 {
+	env::var(key)
+		.ok()
+		.and_then(|v| v.parse::<u64>().ok())
+		.unwrap_or(default)
 }
 
 fn unix_ms() -> u64 {
@@ -18,6 +28,7 @@ fn unix_ms() -> u64 {
 async fn main() -> Result<(), Error> {
 	let endpoint = env::var("ENDPOINT").unwrap_or_else(|_| "http://127.0.0.1:9951".to_string());
 	let app_id = env_u32("APP_ID", 7);
+	let receipt_timeout_secs = env_u64("RECEIPT_TIMEOUT_SECS", 240);
 	let payload = if let Ok(path) = env::var("PAYLOAD_FILE") {
 		std::fs::read(&path).map_err(|_| "read PAYLOAD_FILE failed")?
 	} else {
@@ -36,16 +47,22 @@ async fn main() -> Result<(), Error> {
 	let signer = alice();
 
 	let options = Options::new(app_id);
+	let options = match env::var("NONCE").ok().filter(|value| !value.is_empty()) {
+		Some(value) => options.nonce(value.parse::<u32>().map_err(|_| "invalid NONCE")?),
+		None => options,
+	};
 	let tx = client.tx().data_availability().submit_data(payload);
 	let submit_start_ts_ms = unix_ms();
 	println!("submit_start_ts_ms={submit_start_ts_ms}");
 	let submitted = tx.sign_and_submit(&signer, options).await?;
 	println!("submitted ext_hash={:?}", submitted.ext_hash);
 
-	let receipt = timeout(Duration::from_secs(90), submitted.receipt(true))
+	let receipt = timeout(Duration::from_secs(receipt_timeout_secs), submitted.receipt(true))
 		.await
 		.map_err(|_| "Timed out waiting for transaction receipt")??;
-	let Some(receipt) = receipt else { return Err("Transaction got dropped (no receipt)".into()); };
+	let Some(receipt) = receipt else {
+		return Err("Transaction got dropped (no receipt)".into());
+	};
 
 	let events = receipt.events().await?;
 	if !events.is_extrinsic_success_present() {
@@ -57,9 +74,10 @@ async fn main() -> Result<(), Error> {
 	println!("submit_data ok");
 	println!("endpoint={endpoint}");
 	println!("app_id={app_id}");
+	println!("receipt_timeout_secs={receipt_timeout_secs}");
+	println!("nonce={}", submitted.options.nonce);
 	println!("block_height={}", receipt.block_height);
 	println!("block_hash={:?}", receipt.block_hash);
 	println!("ext_hash={:?}", receipt.ext_hash);
 	Ok(())
 }
-
