@@ -1,7 +1,6 @@
 use avail_rust_client::prelude::*;
 use avail_rust_core::{
-	ext::sp_crypto_hashing::blake2_256,
-	header::DataLookupItem,
+	ext::sp_crypto_hashing::blake2_256, header::DataLookupItem,
 	rpc::system::fetch_extrinsics::Options as FetchExtrinsicsOptions,
 };
 use codec::Encode;
@@ -18,10 +17,9 @@ const DATA_CHUNK_SIZE: usize = 31;
 const SCALAR_SIZE: usize = 32;
 const ROW_EXTENSION_V4: u32 = 2;
 const COL_EXTENSION_V4: u32 = 2;
-const P2P_COLS: u32 = 32;
+const DEFAULT_P2P_COLS: u32 = 32;
 const P2P_ROWS: u32 = 32;
-const DEFAULT_CANARY_RUN_DIR: &str =
-	"/home/ubuntu/engram/testnet/runs/engram-private-testnet-canary-20260603T084703Z";
+const DEFAULT_CANARY_RUN_DIR: &str = "/home/ubuntu/engram/testnet/runs/engram-private-testnet-canary-20260603T084703Z";
 const BASE58_ALPHABET: &[u8] = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 
 #[derive(Debug, Deserialize)]
@@ -88,6 +86,14 @@ struct RuntimeOwner {
 	store_host: String,
 	store_cda_multiaddr: String,
 	store_peer_id: String,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	network_row: Option<u32>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	matrix_row: Option<u32>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	custody_col: Option<u32>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	destination_cell_replica: Option<u32>,
 	runtime_p2p_row: u32,
 	runtime_p2p_col: u32,
 	source: String,
@@ -128,8 +134,24 @@ struct RuntimeStoreOwnership {
 	method: String,
 	missing_owner_coverage: Vec<String>,
 	owner_count: usize,
+	active_owner_count: usize,
+	generated_owner_count: usize,
+	inactive_owner_filtered_count: usize,
+	active_owner_scope: ActiveOwnerScope,
 	owners: Vec<RuntimeOwner>,
 	publisher_env: PublisherEnv,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ActiveOwnerScope {
+	profile: String,
+	mode: String,
+	network_rows: Vec<u32>,
+	replicas_per_destination_cell: u32,
+	fat_replicas_per_column: Option<u32>,
+	owner_count: usize,
+	generated_owner_count: usize,
+	inactive_owner_filtered_count: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -242,11 +264,7 @@ fn expand_lookup(size: u32, index: Vec<DataLookupItem>) -> Vec<ExpandedAppRange>
 }
 
 fn next_power_of_two(value: u32) -> u32 {
-	if value <= 1 {
-		1
-	} else {
-		value.next_power_of_two()
-	}
+	if value <= 1 { 1 } else { value.next_power_of_two() }
 }
 
 fn computed_grid_rows(total_scalars: u32, runtime_cols: u32) -> Result<u32, Box<dyn std::error::Error>> {
@@ -257,13 +275,111 @@ fn computed_grid_rows(total_scalars: u32, runtime_cols: u32) -> Result<u32, Box<
 	Ok(next_power_of_two(current_height.max(1)))
 }
 
-fn custody_col_from_extended(ext_col: u32) -> u32 {
-	(ext_col / COL_EXTENSION_V4) % P2P_COLS
+fn custody_cols_from_env() -> Result<u32, Box<dyn std::error::Error>> {
+	let value = env::var("CDA_CUSTODY_COLS").unwrap_or_else(|_| DEFAULT_P2P_COLS.to_string());
+	let custody_cols = value
+		.parse::<u32>()
+		.map_err(|err| format!("invalid CDA_CUSTODY_COLS={value}: {err}"))?;
+	if !matches!(custody_cols, 8 | 16 | 32) {
+		return Err(format!("unsupported CDA_CUSTODY_COLS={custody_cols}; expected 8, 16, or 32").into());
+	}
+	Ok(custody_cols)
 }
 
-fn custody_virtual_row(original_row: u32, original_col: u32, runtime_cols: u32) -> u32 {
-	let bands = runtime_cols.saturating_add(P2P_COLS - 1) / P2P_COLS;
-	original_row * bands.max(1) + (original_col / P2P_COLS)
+fn parse_u32_list(value: &str) -> Vec<u32> {
+	value
+		.split(',')
+		.filter_map(|item| item.trim().parse::<u32>().ok())
+		.collect()
+}
+
+fn env_u32(name: &str) -> Option<u32> {
+	env::var(name).ok().and_then(|value| value.parse::<u32>().ok())
+}
+
+fn active_scope_from_env(generated_owners: &[RuntimeOwner]) -> ActiveOwnerScope {
+	let profile = env::var("CDA_ACTIVE_TOPOLOGY_PROFILE")
+		.or_else(|_| env::var("CDA_TOPOLOGY_PROFILE"))
+		.unwrap_or_else(|_| "stage-c".to_string());
+	let mode = env::var("ENGRAM_REQUIRED_CELL_OWNER_SCOPE").unwrap_or_else(|_| {
+		if profile == "stage-c" {
+			"all".to_string()
+		} else {
+			"active".to_string()
+		}
+	});
+	let default_rows = match profile.as_str() {
+		"stage-b" | "stage-b-plus" => vec![0],
+		_ => {
+			let mut rows = generated_owners
+				.iter()
+				.filter_map(|owner| owner.network_row)
+				.collect::<Vec<_>>();
+			rows.sort_unstable();
+			rows.dedup();
+			if rows.is_empty() { vec![0] } else { rows }
+		},
+	};
+	let network_rows = env::var("CDA_ACTIVE_STORE_Q_NETWORK_ROWS")
+		.ok()
+		.map(|value| parse_u32_list(&value))
+		.filter(|rows| !rows.is_empty())
+		.unwrap_or(default_rows);
+	let replicas_per_destination_cell =
+		env_u32("CDA_ACTIVE_STORE_Q_REPLICAS_PER_DESTINATION_CELL").unwrap_or_else(|| match profile.as_str() {
+			"stage-b" => 1,
+			"stage-b-plus" => 2,
+			_ => u32::MAX,
+		});
+	let fat_replicas_per_column = env_u32("CDA_ACTIVE_FAT_REPLICAS_PER_COLUMN");
+
+	ActiveOwnerScope {
+		profile,
+		mode,
+		network_rows,
+		replicas_per_destination_cell,
+		fat_replicas_per_column,
+		owner_count: 0,
+		generated_owner_count: generated_owners.len(),
+		inactive_owner_filtered_count: 0,
+	}
+}
+
+fn filter_active_owners(
+	generated_owners: &[RuntimeOwner],
+	scope: &ActiveOwnerScope,
+) -> Result<Vec<RuntimeOwner>, Box<dyn std::error::Error>> {
+	if scope.mode.as_str() == "all" || scope.profile.as_str() == "stage-c" {
+		return Ok(generated_owners.to_vec());
+	}
+	let metadata_missing = generated_owners
+		.iter()
+		.any(|owner| owner.network_row.is_none() || owner.destination_cell_replica.is_none());
+	if metadata_missing {
+		return Err("active Store-Q owner filtering requires network_row and destination_cell_replica metadata".into());
+	}
+	let active = generated_owners
+		.iter()
+		.filter(|owner| {
+			let network_row = owner.network_row.unwrap_or(u32::MAX);
+			let replica = owner.destination_cell_replica.unwrap_or(u32::MAX);
+			scope.network_rows.contains(&network_row) && replica < scope.replicas_per_destination_cell
+		})
+		.cloned()
+		.collect::<Vec<_>>();
+	if active.is_empty() {
+		return Err("active Store-Q owner filtering produced an empty publisher owner set".into());
+	}
+	Ok(active)
+}
+
+fn custody_col_from_extended(ext_col: u32, custody_cols: u32) -> u32 {
+	(ext_col / COL_EXTENSION_V4) % custody_cols
+}
+
+fn custody_virtual_row(original_row: u32, original_col: u32, runtime_cols: u32, custody_cols: u32) -> u32 {
+	let bands = runtime_cols.saturating_add(custody_cols - 1) / custody_cols;
+	original_row * bands.max(1) + (original_col / custody_cols)
 }
 
 fn scalar_to_runtime_cell_hex(chunk: &[u8]) -> Result<String, Box<dyn std::error::Error>> {
@@ -315,11 +431,11 @@ fn base58_decode(value: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
 	Ok(decoded)
 }
 
-fn grid_position_from_peer_id(peer_id: &str) -> Result<(u32, u32), Box<dyn std::error::Error>> {
+fn grid_position_from_peer_id(peer_id: &str, custody_cols: u32) -> Result<(u32, u32), Box<dyn std::error::Error>> {
 	let raw = base58_decode(peer_id)?;
 	let digest = blake2_256_raw(&raw);
 	let row = u16::from_le_bytes([digest[0], digest[1]]) as u32 % P2P_ROWS;
-	let col = u16::from_le_bytes([digest[2], digest[3]]) as u32 % P2P_COLS;
+	let col = u16::from_le_bytes([digest[2], digest[3]]) as u32 % custody_cols;
 	Ok((row, col))
 }
 
@@ -332,6 +448,7 @@ fn parse_csv_line(line: &str) -> Vec<String> {
 
 fn read_runtime_store_owners(
 	canary_run_dir: &Path,
+	custody_cols: u32,
 ) -> Result<(PathBuf, BTreeMap<u32, Vec<RuntimeOwner>>, Vec<RuntimeOwner>), Box<dyn std::error::Error>> {
 	let inv_path = canary_run_dir.join("final-inventories").join("canary-store-nodes.csv");
 	let content = fs::read_to_string(&inv_path)
@@ -354,6 +471,12 @@ fn read_runtime_store_owners(
 			.filter(|value| !value.is_empty())
 			.ok_or_else(|| format!("store inventory row missing value for {name}").into())
 	};
+	let optional_u32 = |row: &[String], name: &str| -> Option<u32> {
+		header_index
+			.get(name)
+			.and_then(|idx| row.get(*idx))
+			.and_then(|value| value.parse::<u32>().ok())
+	};
 
 	let mut owners_by_col = BTreeMap::<u32, Vec<RuntimeOwner>>::new();
 	let mut all_owners = Vec::<RuntimeOwner>::new();
@@ -361,7 +484,7 @@ fn read_runtime_store_owners(
 	for line in lines.filter(|line| !line.trim().is_empty()) {
 		let row = parse_csv_line(line);
 		let peer_id = field(&row, "runtime_cda_peer_id")?;
-		let (runtime_row, runtime_col) = grid_position_from_peer_id(&peer_id)?;
+		let (runtime_row, runtime_col) = grid_position_from_peer_id(&peer_id, custody_cols)?;
 		let inventory_col = field(&row, "runtime_p2p_col")?.parse::<u32>()?;
 		if runtime_col != inventory_col {
 			return Err(format!(
@@ -379,6 +502,10 @@ fn read_runtime_store_owners(
 			store_host: field(&row, "store_host")?,
 			store_cda_multiaddr: field(&row, "store_cda_multiaddr")?,
 			store_peer_id: peer_id,
+			network_row: optional_u32(&row, "network_row"),
+			matrix_row: optional_u32(&row, "matrix_row"),
+			custody_col: optional_u32(&row, "custody_col"),
+			destination_cell_replica: optional_u32(&row, "destination_cell_replica"),
 			runtime_p2p_row: runtime_row,
 			runtime_p2p_col: runtime_col,
 			source: "canary-store-nodes.csv + position_from_peer_id_bytes".to_string(),
@@ -413,20 +540,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 	let receipt_path = &args[1];
 	let out_path = args.get(2).cloned().unwrap_or_else(|| {
-		let parent = Path::new(receipt_path)
-			.parent()
-			.unwrap_or_else(|| Path::new("."));
-		parent
-			.join("payload-recovery-map.json")
-			.to_string_lossy()
-			.into_owned()
+		let parent = Path::new(receipt_path).parent().unwrap_or_else(|| Path::new("."));
+		parent.join("payload-recovery-map.json").to_string_lossy().into_owned()
 	});
 
 	let receipt: SubmissionReceipt = serde_json::from_slice(&fs::read(receipt_path)?)?;
 	let endpoint = env::var("ENDPOINT").unwrap_or_else(|_| receipt.submit_endpoint.clone());
 	let canary_run_dir = env::var("CANARY_RUN_DIR").unwrap_or_else(|_| DEFAULT_CANARY_RUN_DIR.to_string());
-	let (owner_inventory_path, owners_by_col, all_runtime_owners) =
-		read_runtime_store_owners(Path::new(&canary_run_dir))?;
+	let custody_cols = custody_cols_from_env()?;
+	let (owner_inventory_path, _owners_by_col, all_runtime_owners) =
+		read_runtime_store_owners(Path::new(&canary_run_dir), custody_cols)?;
+	let mut active_owner_scope = active_scope_from_env(&all_runtime_owners);
+	let active_runtime_owners = filter_active_owners(&all_runtime_owners, &active_owner_scope)?;
+	let mut active_owners_by_col = BTreeMap::<u32, Vec<RuntimeOwner>>::new();
+	for owner in &active_runtime_owners {
+		active_owners_by_col
+			.entry(owner.runtime_p2p_col)
+			.or_default()
+			.push(owner.clone());
+	}
+	for owners in active_owners_by_col.values_mut() {
+		owners.sort_by(|left, right| {
+			left.network_row
+				.cmp(&right.network_row)
+				.then(left.destination_cell_replica.cmp(&right.destination_cell_replica))
+				.then(left.store_name.cmp(&right.store_name))
+		});
+	}
+	active_owner_scope.owner_count = active_runtime_owners.len();
+	active_owner_scope.generated_owner_count = all_runtime_owners.len();
+	active_owner_scope.inactive_owner_filtered_count =
+		all_runtime_owners.len().saturating_sub(active_runtime_owners.len());
 
 	let client = Client::new(&endpoint).await?;
 	let chain = client.chain();
@@ -437,11 +581,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 		.await?
 		.ok_or("block hash not found for receipt block_number")?;
 	if actual_block_hash != expected_block_hash {
-		return Err(format!(
-			"receipt block hash mismatch: receipt={} chain={actual_block_hash:?}",
-			receipt.block_hash
-		)
-		.into());
+		return Err(
+			format!("receipt block hash mismatch: receipt={} chain={actual_block_hash:?}", receipt.block_hash).into()
+		);
 	}
 
 	let tx_hash = <H256 as FromStr>::from_str(&receipt.extrinsic_hash)?;
@@ -458,11 +600,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 		.ok_or("extrinsic hash from receipt was not found in receipt block")?;
 	if let Some(signer) = &ext_info.signer_payload {
 		if signer.app_id != receipt.app_id {
-			return Err(format!(
-				"receipt app_id mismatch: receipt={} extrinsic={}",
-				receipt.app_id, signer.app_id
-			)
-			.into());
+			return Err(
+				format!("receipt app_id mismatch: receipt={} extrinsic={}", receipt.app_id, signer.app_id).into()
+			);
 		}
 	}
 
@@ -475,7 +615,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 		.block
 		.extrinsics
 		.get(tx_index_usize)
-		.ok_or_else(|| format!("tx_index {} is outside block extrinsics len {}", ext_info.ext_index, legacy_block.block.extrinsics.len()))?
+		.ok_or_else(|| {
+			format!(
+				"tx_index {} is outside block extrinsics len {}",
+				ext_info.ext_index,
+				legacy_block.block.extrinsics.len()
+			)
+		})?
 		.clone();
 	let actual_ext_hash = blake2_256_hex(&tx_bytes);
 	if actual_ext_hash.to_ascii_lowercase() != receipt.extrinsic_hash.to_ascii_lowercase() {
@@ -553,9 +699,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 		let chunk = &app_stream_padded[chunk_start..chunk_start + DATA_CHUNK_SIZE];
 		let ext_row = row * ROW_EXTENSION_V4;
 		let ext_col = col * COL_EXTENSION_V4;
-		let custody_col = custody_col_from_extended(ext_col);
-		let virtual_row = custody_virtual_row(row, col, runtime_cols);
-		let owner_candidates = owners_by_col.get(&custody_col).cloned().unwrap_or_default();
+		let custody_col = custody_col_from_extended(ext_col, custody_cols);
+		let virtual_row = custody_virtual_row(row, col, runtime_cols, custody_cols);
+		let owner_candidates = active_owners_by_col.get(&custody_col).cloned().unwrap_or_default();
 		if owner_candidates.is_empty() {
 			return Err(format!(
 				"missing_owner_coverage: custody_col={custody_col} scalar_index={scalar_index} ext_row={ext_row} ext_col={ext_col}"
@@ -583,7 +729,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 			ext_row,
 			ext_col,
 			custody_col,
-			custody_route_method: "fixed_32_column_row_major_wrap".to_string(),
+			custody_route_method: format!("fixed_{custody_cols}_column_row_major_wrap"),
 			runtime_owner,
 			runtime_owner_candidates: owner_candidates,
 			expected_chunk_hex: const_hex::encode(chunk),
@@ -591,7 +737,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 		});
 	}
 
-	let owner_multiaddrs = all_runtime_owners
+	let owner_multiaddrs = active_runtime_owners
 		.iter()
 		.map(|owner| owner.store_cda_multiaddr.as_str())
 		.collect::<Vec<_>>()
@@ -642,17 +788,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 			"Phase 10.1 generated this map natively in Rust from receipt, on-chain header data, kate_blockLength, and current Store inventory.".to_string(),
 			"Current JSON schema is preserved for compatibility with existing publication, retrieval, and reassembly scripts.".to_string(),
 			"Required CDA cells use runtime-grid dimensions and systematic row/column extension coordinates, not first equal-value matches.".to_string(),
-			"Store custody routing is fixed to 32 columns: custody_col=(ext_col/COL_EXTENSION_V4)%32; runtime columns beyond 31 are additional row-major bands over the same Store columns.".to_string(),
+			format!("Store custody routing uses {custody_cols} physical columns from CDA_CUSTODY_COLS: custody_col=(ext_col/COL_EXTENSION_V4)%{custody_cols}; wider runtime grids are additional row-major bands over the same Store columns."),
 			"expected_app_stream.padded_hex and chunks_hex are compatibility-only fields until native reassembly can use hash-based compact evidence.".to_string(),
 		],
 		required_cda_ext_cells: required_cda,
 		coordinate_mapping: CoordinateMapping {
 			status: "yes".to_string(),
-			method: "systematic_runtime_coordinate_with_fixed_32_column_custody(ext_row=original_row*ROW_EXTENSION_V4,ext_col=original_col*COL_EXTENSION_V4,custody_col=(ext_col/COL_EXTENSION_V4)%P2P_COLS)".to_string(),
+			method: format!("systematic_runtime_coordinate_with_fixed_{custody_cols}_column_custody(ext_row=original_row*ROW_EXTENSION_V4,ext_col=original_col*COL_EXTENSION_V4,custody_col=(ext_col/COL_EXTENSION_V4)%CDA_CUSTODY_COLS)"),
 			row_extension: ROW_EXTENSION_V4,
 			col_extension: COL_EXTENSION_V4,
-			store_custody_cols: P2P_COLS,
-			custody_route_method: "fixed_32_column_row_major_wrap".to_string(),
+			store_custody_cols: custody_cols,
+			custody_route_method: format!("fixed_{custody_cols}_column_row_major_wrap"),
 		},
 		runtime_store_ownership: RuntimeStoreOwnership {
 			status: "yes".to_string(),
@@ -660,6 +806,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 			method: "position_from_peer_id_bytes(runtime_cda_peer_id)".to_string(),
 			missing_owner_coverage: Vec::new(),
 			owner_count: all_runtime_owners.len(),
+			active_owner_count: active_runtime_owners.len(),
+			generated_owner_count: all_runtime_owners.len(),
+			inactive_owner_filtered_count: all_runtime_owners
+				.len()
+				.saturating_sub(active_runtime_owners.len()),
+			active_owner_scope,
 			owners: all_runtime_owners,
 			publisher_env: PublisherEnv {
 				cda_raw_cell_owner_store_multiaddrs: owner_multiaddrs,
@@ -693,4 +845,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 	);
 	println!("required_cda_ext_cells={}", map.required_cda_ext_cells.len());
 	Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+	use super::{custody_col_from_extended, custody_virtual_row};
+
+	#[test]
+	fn cda8_extended_columns_wrap_across_eight_custody_columns() {
+		assert_eq!(custody_col_from_extended(0, 8), 0);
+		assert_eq!(custody_col_from_extended(14, 8), 7);
+		assert_eq!(custody_col_from_extended(16, 8), 0);
+		assert_eq!(custody_col_from_extended(62, 8), 7);
+		assert_eq!(custody_col_from_extended(64, 8), 0);
+		assert_eq!(custody_col_from_extended(126, 8), 7);
+	}
+
+	#[test]
+	fn cda8_virtual_rows_preserve_wrapped_column_bands() {
+		assert_eq!(custody_virtual_row(0, 0, 64, 8), 0);
+		assert_eq!(custody_virtual_row(0, 63, 64, 8), 7);
+		assert_eq!(custody_virtual_row(1, 0, 64, 8), 8);
+	}
 }
